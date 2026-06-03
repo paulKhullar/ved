@@ -154,6 +154,47 @@ impl Editor {
         self.cursor.col = self.cursor.col.saturating_add(1);
     }
 
+    fn insert_newline(&mut self) {
+        self.ensure_line_exists();
+        let row = self.cursor.row as usize;
+
+        let byte_idx = {
+            let line = &self.document.lines[row];
+            Self::col_to_byte_index(line, self.cursor.col)
+        };
+
+        let new_line = self.document.lines[row].split_off(byte_idx);
+        self.document.lines.insert(row + 1, new_line);
+        self.cursor.row = self.cursor.row.saturating_add(1);
+        self.cursor.col = 0;
+    }
+
+    fn backspace(&mut self) {
+        self.ensure_line_exists();
+        let row = self.cursor.row as usize;
+
+        if self.cursor.col > 0 {
+            let line = &mut self.document.lines[row];
+            let delete_col = self.cursor.col.saturating_sub(1);
+            let delete_byte_idx = Self::col_to_byte_index(line, delete_col);
+            line.remove(delete_byte_idx);
+            self.cursor.col = delete_col;
+            return;
+        }
+
+        if row == 0 {
+            return;
+        }
+
+        let current = self.document.lines.remove(row);
+        let prev_row = row - 1;
+
+        let prev_len_chars = self.document.lines[prev_row].chars().count().min(u16::MAX as usize) as u16;
+        self.document.lines[prev_row].push_str(&current);
+        self.cursor.row = prev_row as u16;
+        self.cursor.col = prev_len_chars;
+    }
+
     fn draw(&self) -> Result<()> {
         let mut out = stdout();
         let (cols, rows) = terminal::size()?;
@@ -240,6 +281,8 @@ fn main() -> Result<()> {
                 },
                 Mode::Insert => match key.code {
                     KeyCode::Esc => editor.enter_normal_mode(),
+                    KeyCode::Enter => editor.insert_newline(),
+                    KeyCode::Backspace => editor.backspace(),
                     KeyCode::Char(ch)
                         if !key.modifiers.contains(KeyModifiers::CONTROL)
                             && !key.modifiers.contains(KeyModifiers::ALT) =>
