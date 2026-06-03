@@ -1,3 +1,4 @@
+mod cells;
 mod document;
 mod editor;
 

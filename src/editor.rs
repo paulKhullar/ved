@@ -5,10 +5,11 @@ use crossterm::{
     cursor,
     event::{KeyCode, KeyEvent, KeyModifiers},
     execute,
-    style::Print,
+    style::{Attribute, Print, SetAttribute},
     terminal::{self, ClearType},
 };
 
+use crate::cells;
 use crate::document::Document;
 
 // --- Mode (Phase 3 + 5 + 7) ---
@@ -43,6 +44,29 @@ pub struct Editor {
     // Tracks a partial two-key sequence. Currently only used for 'g' → 'g' (go to first line).
     // Option::take() is used to read-and-clear it atomically — a handy Rust idiom.
     pending_char: Option<char>,
+}
+
+// Converts a # %% marker line into a full-width horizontal divider, e.g.
+//   "# %% [Setup]"  →  "── [Setup] ────────────────────────────────────────"
+// Text after "# %%" is used as a label; if blank the divider is just dashes.
+// The file is never touched — this is a display-only transform.
+fn render_cell_divider(line: &str, width: usize) -> String {
+    let label_text = line["# %%".len()..].trim();
+    let dash = '─';
+    if label_text.is_empty() {
+        dash.to_string().repeat(width)
+    } else {
+        let label = format!(" {label_text} ");
+        // Leave at least 2 dashes on the left, fill the rest on the right.
+        let left_dashes = 2;
+        let right_dashes = width.saturating_sub(left_dashes + label.len());
+        format!(
+            "{}{}{}" ,
+            dash.to_string().repeat(left_dashes),
+            label,
+            dash.to_string().repeat(right_dashes),
+        )
+    }
 }
 
 // --- Free helper — kept outside `impl` because it doesn't need `self` ---
@@ -121,15 +145,34 @@ impl Editor {
     }
 
     fn move_up(&mut self) {
-        self.cursor.row = self.cursor.row.saturating_sub(1);
+        if self.cursor.row == 0 {
+            return;
+        }
+        self.cursor.row -= 1;
+        // If we landed on a # %% marker, skip one more step up.
+        // Exception: if the marker is at row 0 there's nowhere above it, so stay.
+        let row = self.cursor.row as usize;
+        if row > 0 && cells::is_cell_marker(&self.document.lines[row]) {
+            self.cursor.row -= 1;
+        }
         self.clamp_col();
     }
 
     fn move_down(&mut self) {
-        if (self.cursor.row as usize) + 1 < self.document.lines.len() {
-            self.cursor.row += 1;
-            self.clamp_col();
+        let next = self.cursor.row as usize + 1;
+        if next >= self.document.lines.len() {
+            return;
         }
+        self.cursor.row += 1;
+        // If we landed on a # %% marker, skip one more step down.
+        // Exception: if it's the last line there's nowhere below it, so stay.
+        let row = self.cursor.row as usize;
+        if cells::is_cell_marker(&self.document.lines[row]) {
+            if row + 1 < self.document.lines.len() {
+                self.cursor.row += 1;
+            }
+        }
+        self.clamp_col();
     }
 
     fn go_to_line_start(&mut self) {
@@ -444,6 +487,62 @@ impl Editor {
     }
 
     // -------------------------------------------------------------------------
+    // Phase 8a — cell navigation
+    // -------------------------------------------------------------------------
+
+    // ]c — jump to the next # %% marker
+    fn jump_to_next_cell(&mut self) {
+        let row = self.cursor.row as usize;
+        match cells::next_cell_marker(&self.document.lines, row) {
+            Some(next) => {
+                self.cursor.row = next as u16;
+                self.cursor.col = 0;
+            }
+            None => self.message = Some("No next cell".into()),
+        }
+    }
+
+    // [c — jump to the previous # %% marker
+    fn jump_to_prev_cell(&mut self) {
+        let row = self.cursor.row as usize;
+        match cells::prev_cell_marker(&self.document.lines, row) {
+            Some(prev) => {
+                self.cursor.row = prev as u16;
+                self.cursor.col = 0;
+            }
+            None => self.message = Some("No previous cell".into()),
+        }
+    }
+
+    // Space+Enter — stub for 8b. Shows what would be sent so we can verify the range is right.
+    fn send_current_cell(&mut self) {
+        let row = self.cursor.row as usize;
+        let range = cells::find_current_cell(&self.document.lines, row);
+        let line_count = range.end - range.start;
+        // In 8b this will write those lines to the REPL's stdin.
+        // For now just confirm which lines were identified.
+        self.message = Some(format!(
+            "Cell lines {}–{} ({} lines) — REPL not yet connected",
+            range.start + 1,
+            range.end,
+            line_count
+        ));
+    }
+
+    // Returns a short cell indicator for the status bar, e.g. " [Cell 2/4]".
+    // Returns an empty string if the document has no cell markers.
+    fn cell_status_text(&self) -> String {
+        let has_markers = self.document.lines.iter().any(|l| cells::is_cell_marker(l));
+        if !has_markers {
+            return String::new();
+        }
+        let row = self.cursor.row as usize;
+        let num = cells::current_cell_number(&self.document.lines, row);
+        let total = cells::count_cells(&self.document.lines);
+        format!(" [Cell {num}/{total}]")
+    }
+
+    // -------------------------------------------------------------------------
     // Phase 5 — save & command mode
     // -------------------------------------------------------------------------
 
@@ -538,6 +637,17 @@ impl Editor {
                 terminal::Clear(ClearType::CurrentLine)
             )?;
             match self.document.lines.get(doc_row) {
+                Some(text) if cells::is_cell_marker(text) => {
+                    // Render # %% lines as a bold full-width divider.
+                    // The actual file is unchanged — this is purely cosmetic.
+                    let divider = render_cell_divider(text, cols as usize);
+                    execute!(
+                        out,
+                        SetAttribute(Attribute::Bold),
+                        Print(divider),
+                        SetAttribute(Attribute::Reset),
+                    )?;
+                }
                 Some(text) => {
                     let visible: String = text.chars().take(cols as usize).collect();
                     execute!(out, Print(visible))?;
@@ -577,11 +687,14 @@ impl Editor {
                 } else {
                     format!("  {}", self.count_buf)
                 };
+                let cell_info = self.cell_status_text();
                 match &self.message {
                     Some(msg) => {
-                        execute!(out, Print(format!("{mode_label}{modified}  {msg}")))?
+                        execute!(out, Print(format!("{mode_label}{modified}{cell_info}  {msg}")))?
                     }
-                    None => execute!(out, Print(format!("{mode_label}{modified}{count_hint}")))?,
+                    None => {
+                        execute!(out, Print(format!("{mode_label}{modified}{cell_info}{count_hint}")))?
+                    }
                 }
 
                 // Convert document cursor position to screen position.
@@ -645,10 +758,11 @@ impl Editor {
         // so we don't hold a reference to self.pending_char while we use the value.
         if let Some(pending) = self.pending_char.take() {
             match (pending, key.code) {
-                ('g', KeyCode::Char('g')) => {
-                    self.go_to_first_line();
-                    return Ok(false);
-                }
+                ('g', KeyCode::Char('g')) => { self.go_to_first_line(); return Ok(false); }
+                (']', KeyCode::Char('c')) => { self.jump_to_next_cell(); return Ok(false); }
+                ('[', KeyCode::Char('c')) => { self.jump_to_prev_cell(); return Ok(false); }
+                // Space+Enter sends the current cell to the REPL (stub in 8a, real in 8b).
+                (' ', KeyCode::Enter)    => { self.send_current_cell(); return Ok(false); }
                 _ => {
                     // Unknown two-key sequence — ignore the pending char and fall through
                     // to handle the current key normally.
@@ -736,6 +850,12 @@ impl Editor {
             // Operators — enter OperatorPending to wait for the motion
             KeyCode::Char('d') => self.mode = Mode::OperatorPending('d'),
             KeyCode::Char('c') => self.mode = Mode::OperatorPending('c'),
+
+            // Cell navigation — first key of a two-key sequence
+            KeyCode::Char(']') => { self.pending_char = Some(']'); }
+            KeyCode::Char('[') => { self.pending_char = Some('['); }
+            // Space starts the Space+Enter "send cell" chord
+            KeyCode::Char(' ') => { self.pending_char = Some(' '); }
 
             // Command mode
             KeyCode::Char(':') => {
