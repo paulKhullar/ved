@@ -18,7 +18,6 @@ impl TerminalGuard {
         if let Err(err) = execute!(
             stdout(),
             terminal::EnterAlternateScreen,
-            cursor::Hide,
             terminal::Clear(ClearType::All),
             cursor::MoveTo(0, 0),
         ) {
@@ -59,17 +58,59 @@ impl Document {
 }
 
 struct Editor {
+    cursor: Position,
     document: Document,
 }
 
 impl Editor {
     fn new(document: Document) -> Self {
-        Self { document }
+        Self {
+            cursor: Position { row: 0, col: 0 },
+            document,
+        }
+    }
+
+    fn current_line_len(&self) -> u16 {
+        let row = self.cursor.row as usize;
+        self.document
+            .lines
+            .get(row)
+            .map(|line| line.len().min(u16::MAX as usize) as u16)
+            .unwrap_or(0)
+    }
+
+    fn clamp_col(&mut self) {
+        let max_col = self.current_line_len();
+        self.cursor.col = self.cursor.col.min(max_col);
+    }
+
+    fn move_left(&mut self) {
+        self.cursor.col = self.cursor.col.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        let max_col = self.current_line_len();
+        if self.cursor.col < max_col {
+            self.cursor.col += 1;
+        }
+    }
+
+    fn move_up(&mut self) {
+        self.cursor.row = self.cursor.row.saturating_sub(1);
+        self.clamp_col();
+    }
+
+    fn move_down(&mut self) {
+        let row = self.cursor.row as usize;
+        if row + 1 < self.document.lines.len() {
+            self.cursor.row += 1;
+            self.clamp_col();
+        }
     }
 
     fn draw(&self) -> Result<()> {
         let mut out = stdout();
-        let (_cols, rows) = terminal::size()?;
+        let (cols, rows) = terminal::size()?;
 
         execute!(out, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
 
@@ -85,9 +126,18 @@ impl Editor {
             }
         }
 
+        let cursor_row = self.cursor.row.min(rows.saturating_sub(1));
+        let cursor_col = self.cursor.col.min(cols.saturating_sub(1));
+        execute!(out, cursor::MoveTo(cursor_col, cursor_row))?;
         out.flush()?;
         Ok(())
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Position {
+    row: u16,
+    col: u16,
 }
 
 fn main() -> Result<()> {
@@ -97,7 +147,7 @@ fn main() -> Result<()> {
         Some(path) => Document::open(path)?,
         None => Document::empty(),
     };
-    let editor = Editor::new(document);
+    let mut editor = Editor::new(document);
 
     loop {
         editor.draw()?;
@@ -106,6 +156,14 @@ fn main() -> Result<()> {
                 if key.code == KeyCode::Char('q') && key.modifiers.is_empty() =>
             {
                 break;
+            }
+            Event::Key(key) if matches!(key.code, KeyCode::Char('h') | KeyCode::Left) => editor.move_left(),
+            Event::Key(key) if matches!(key.code, KeyCode::Char('l') | KeyCode::Right) => {
+                editor.move_right();
+            }
+            Event::Key(key) if matches!(key.code, KeyCode::Char('k') | KeyCode::Up) => editor.move_up(),
+            Event::Key(key) if matches!(key.code, KeyCode::Char('j') | KeyCode::Down) => {
+                editor.move_down();
             }
             Event::Resize(_, _) => {}
             _ => {}
