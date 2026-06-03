@@ -1,8 +1,11 @@
 mod cells;
 mod document;
 mod editor;
+mod repl;
 
 use std::io::{stdout, Write};
+
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
@@ -54,15 +57,24 @@ fn main() -> Result<()> {
     let mut editor = Editor::new(document, file_path);
 
     loop {
+        // Drain any REPL output that arrived since the last tick.
+        // This happens before draw() so new output is always visible immediately.
+        editor.drain_repl_output();
         editor.draw()?;
-        match event::read()? {
-            Event::Key(key) => {
-                if editor.handle_key(key)? {
-                    break;
+
+        // poll(50ms) instead of blocking read() so output appears promptly even
+        // when the user isn't typing. If no key arrives within 50ms we loop back
+        // and redraw — the REPL output panel updates at ~20fps.
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if editor.handle_key(key)? {
+                        break;
+                    }
                 }
+                Event::Resize(_, _) => {}
+                _ => {}
             }
-            Event::Resize(_, _) => {} // draw() re-queries size each frame — resize is free
-            _ => {}
         }
     }
     Ok(())

@@ -11,6 +11,7 @@ use crossterm::{
 
 use crate::cells;
 use crate::document::Document;
+use crate::repl::Repl;
 
 // --- Mode (Phase 3 + 5 + 7) ---
 // OperatorPending is the key Phase 7 addition: it stores *which* operator was pressed
@@ -44,6 +45,10 @@ pub struct Editor {
     // Tracks a partial two-key sequence. Currently only used for 'g' → 'g' (go to first line).
     // Option::take() is used to read-and-clear it atomically — a handy Rust idiom.
     pending_char: Option<char>,
+
+    // Phase 8b — REPL integration
+    repl: Option<Repl>,       // None until first Space+Enter in a .py file (lazy start)
+    output_buf: Vec<String>,  // lines received from REPL, shown in the panel below the document
 }
 
 // Converts a # %% marker line into a full-width horizontal divider, e.g.
@@ -83,6 +88,9 @@ fn col_to_byte(line: &str, col: u16) -> usize {
     line.len() // col is past the end → return the end byte
 }
 
+// Number of output lines shown in the REPL panel (not counting the separator row).
+const OUTPUT_PANEL_HEIGHT: usize = 8;
+
 impl Editor {
     pub fn new(document: Document, file_path: Option<String>) -> Self {
         Self {
@@ -96,6 +104,8 @@ impl Editor {
             message: None,
             count_buf: String::new(),
             pending_char: None,
+            repl: None,
+            output_buf: Vec::new(),
         }
     }
 
@@ -514,19 +524,81 @@ impl Editor {
         }
     }
 
-    // Space+Enter — stub for 8b. Shows what would be sent so we can verify the range is right.
+    // Space+Enter — send the current cell to the REPL, starting it if needed.
     fn send_current_cell(&mut self) {
+        if let Err(e) = self.try_send_current_cell() {
+            self.message = Some(format!("REPL error: {e}"));
+        }
+    }
+
+    fn try_send_current_cell(&mut self) -> anyhow::Result<()> {
+        if !self.is_python_file() {
+            self.message = Some("Space+Enter only works in .py files".into());
+            return Ok(());
+        }
+
+        // Lazy start: spin up the REPL on the first send, not at startup.
+        // This means non-.py files never pay the cost of spawning Python.
+        if self.repl.is_none() {
+            match Repl::start() {
+                Ok(r) => {
+                    self.repl = Some(r);
+                    // Don't set message here — "Python started" noise is annoying;
+                    // the panel appearing is signal enough.
+                }
+                Err(e) => {
+                    self.message = Some(format!("{e}"));
+                    return Ok(());
+                }
+            }
+        }
+
         let row = self.cursor.row as usize;
         let range = cells::find_current_cell(&self.document.lines, row);
-        let line_count = range.end - range.start;
-        // In 8b this will write those lines to the REPL's stdin.
-        // For now just confirm which lines were identified.
-        self.message = Some(format!(
-            "Cell lines {}–{} ({} lines) — REPL not yet connected",
-            range.start + 1,
-            range.end,
-            line_count
-        ));
+        let end = range.end.min(self.document.lines.len());
+        let lines: Vec<String> = self.document.lines[range.start..end].to_vec();
+        let n = lines.len();
+
+        if let Some(repl) = &mut self.repl {
+            repl.send_lines(&lines)?;
+            self.message = Some(format!("▶ sent {n} lines"));
+        }
+
+        Ok(())
+    }
+
+    // Returns true if the open file is a Python file (by extension).
+    // Used to decide whether to auto-start the REPL on Space+Enter.
+    fn is_python_file(&self) -> bool {
+        self.file_path
+            .as_deref()
+            .map(|p| p.ends_with(".py"))
+            .unwrap_or(false)
+    }
+
+    // Drain any new lines from the REPL channel into output_buf.
+    // Called from the main loop once per tick (before draw) so output appears promptly.
+    pub fn drain_repl_output(&mut self) {
+        if let Some(repl) = &self.repl {
+            let new_lines = repl.poll_output();
+            self.output_buf.extend(new_lines);
+            // Cap so the buffer doesn't grow forever on chatty cells.
+            const MAX_OUTPUT: usize = 1000;
+            if self.output_buf.len() > MAX_OUTPUT {
+                let excess = self.output_buf.len() - MAX_OUTPUT;
+                self.output_buf.drain(..excess);
+            }
+        }
+    }
+
+    // How many screen rows to reserve for the output panel.
+    // 0 when no REPL is running and there's nothing to show.
+    fn panel_rows(&self) -> usize {
+        if self.repl.is_some() || !self.output_buf.is_empty() {
+            OUTPUT_PANEL_HEIGHT + 1 // +1 for the "── REPL ──" separator line
+        } else {
+            0
+        }
     }
 
     // Returns a short cell indicator for the status bar, e.g. " [Cell 2/4]".
@@ -623,12 +695,16 @@ impl Editor {
     pub fn draw(&mut self) -> Result<()> {
         let mut out = stdout();
         let (cols, rows) = terminal::size()?;
-        let content_rows = rows.saturating_sub(1) as usize;
+        // panel_h is 0 when no REPL is running, or OUTPUT_PANEL_HEIGHT+1 once it starts.
+        // Subtracting it from content_rows shrinks the document area to make room.
+        let panel_h = self.panel_rows();
+        let content_rows = (rows as usize).saturating_sub(1 + panel_h);
 
         self.scroll_to_cursor(content_rows);
 
         execute!(out, cursor::Hide, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
 
+        // --- Document area ---
         for screen_row in 0..content_rows {
             let doc_row = self.scroll_offset + screen_row;
             execute!(
@@ -638,8 +714,6 @@ impl Editor {
             )?;
             match self.document.lines.get(doc_row) {
                 Some(text) if cells::is_cell_marker(text) => {
-                    // Render # %% lines as a bold full-width divider.
-                    // The actual file is unchanged — this is purely cosmetic.
                     let divider = render_cell_divider(text, cols as usize);
                     execute!(
                         out,
@@ -654,6 +728,41 @@ impl Editor {
                 }
                 None => {
                     execute!(out, Print("~"))?;
+                }
+            }
+        }
+
+        // --- REPL output panel ---
+        if panel_h > 0 {
+            // Separator line
+            let sep_row = content_rows as u16;
+            execute!(
+                out,
+                cursor::MoveTo(0, sep_row),
+                terminal::Clear(ClearType::CurrentLine)
+            )?;
+            let header = "── REPL ";
+            let fill = "─".repeat((cols as usize).saturating_sub(header.len()));
+            execute!(
+                out,
+                SetAttribute(Attribute::Bold),
+                Print(format!("{header}{fill}")),
+                SetAttribute(Attribute::Reset),
+            )?;
+
+            // Show the last OUTPUT_PANEL_HEIGHT lines of output.
+            let skip = self.output_buf.len().saturating_sub(OUTPUT_PANEL_HEIGHT);
+            let visible_lines: Vec<&String> = self.output_buf.iter().skip(skip).collect();
+            for i in 0..OUTPUT_PANEL_HEIGHT {
+                let screen_row = content_rows as u16 + 1 + i as u16;
+                execute!(
+                    out,
+                    cursor::MoveTo(0, screen_row),
+                    terminal::Clear(ClearType::CurrentLine)
+                )?;
+                if let Some(line) = visible_lines.get(i) {
+                    let visible: String = line.chars().take(cols as usize).collect();
+                    execute!(out, Print(visible))?;
                 }
             }
         }
