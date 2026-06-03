@@ -18,6 +18,7 @@ impl TerminalGuard {
         if let Err(err) = execute!(
             stdout(),
             terminal::EnterAlternateScreen,
+            cursor::Hide,
             terminal::Clear(ClearType::All),
             cursor::MoveTo(0, 0),
         ) {
@@ -112,23 +113,33 @@ impl Editor {
         let mut out = stdout();
         let (cols, rows) = terminal::size()?;
 
-        execute!(out, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+        // Hide the cursor while we redraw, so you don't see it "teleport" as we paint lines.
+        execute!(
+            out,
+            cursor::Hide,
+            cursor::MoveTo(0, 0),
+            terminal::Clear(ClearType::All)
+        )?;
 
+        // Draw by absolute positioning each row to avoid scrolling artifacts from `\r\n`.
         for row in 0..rows {
             let line = self.document.lines.get(row as usize);
+            execute!(out, cursor::MoveTo(0, row), terminal::Clear(ClearType::CurrentLine))?;
             match line {
                 Some(text) => {
-                    execute!(out, Print(text), Print("\r\n"))?;
+                    // Simple viewport: truncate by characters to avoid wrapping.
+                    let visible: String = text.chars().take(cols as usize).collect();
+                    execute!(out, Print(visible))?;
                 }
                 None => {
-                    execute!(out, Print("~"), Print("\r\n"))?;
+                    execute!(out, Print("~"))?;
                 }
             }
         }
 
         let cursor_row = self.cursor.row.min(rows.saturating_sub(1));
         let cursor_col = self.cursor.col.min(cols.saturating_sub(1));
-        execute!(out, cursor::MoveTo(cursor_col, cursor_row))?;
+        execute!(out, cursor::MoveTo(cursor_col, cursor_row), cursor::Show)?;
         out.flush()?;
         Ok(())
     }
