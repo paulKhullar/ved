@@ -9,6 +9,12 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Insert,
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -61,6 +67,7 @@ impl Document {
 struct Editor {
     cursor: Position,
     document: Document,
+    mode: Mode,
 }
 
 impl Editor {
@@ -68,6 +75,7 @@ impl Editor {
         Self {
             cursor: Position { row: 0, col: 0 },
             document,
+            mode: Mode::Normal,
         }
     }
 
@@ -109,6 +117,14 @@ impl Editor {
         }
     }
 
+    fn enter_insert_mode(&mut self) {
+        self.mode = Mode::Insert;
+    }
+
+    fn enter_normal_mode(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
     fn draw(&self) -> Result<()> {
         let mut out = stdout();
         let (cols, rows) = terminal::size()?;
@@ -121,8 +137,10 @@ impl Editor {
             terminal::Clear(ClearType::All)
         )?;
 
+        let content_rows = rows.saturating_sub(1);
+
         // Draw by absolute positioning each row to avoid scrolling artifacts from `\r\n`.
-        for row in 0..rows {
+        for row in 0..content_rows {
             let line = self.document.lines.get(row as usize);
             execute!(out, cursor::MoveTo(0, row), terminal::Clear(ClearType::CurrentLine))?;
             match line {
@@ -137,7 +155,19 @@ impl Editor {
             }
         }
 
-        let cursor_row = self.cursor.row.min(rows.saturating_sub(1));
+        let status_row = rows.saturating_sub(1);
+        execute!(
+            out,
+            cursor::MoveTo(0, status_row),
+            terminal::Clear(ClearType::CurrentLine)
+        )?;
+        let mode_text = match self.mode {
+            Mode::Normal => "-- NORMAL --",
+            Mode::Insert => "-- INSERT --",
+        };
+        execute!(out, Print(mode_text))?;
+
+        let cursor_row = self.cursor.row.min(content_rows.saturating_sub(1));
         let cursor_col = self.cursor.col.min(cols.saturating_sub(1));
         execute!(out, cursor::MoveTo(cursor_col, cursor_row), cursor::Show)?;
         out.flush()?;
@@ -166,16 +196,24 @@ fn main() -> Result<()> {
             Event::Key(key)
                 if key.code == KeyCode::Char('q') && key.modifiers.is_empty() =>
             {
-                break;
+                if editor.mode == Mode::Normal {
+                    break;
+                }
             }
-            Event::Key(key) if matches!(key.code, KeyCode::Char('h') | KeyCode::Left) => editor.move_left(),
-            Event::Key(key) if matches!(key.code, KeyCode::Char('l') | KeyCode::Right) => {
-                editor.move_right();
-            }
-            Event::Key(key) if matches!(key.code, KeyCode::Char('k') | KeyCode::Up) => editor.move_up(),
-            Event::Key(key) if matches!(key.code, KeyCode::Char('j') | KeyCode::Down) => {
-                editor.move_down();
-            }
+            Event::Key(key) => match editor.mode {
+                Mode::Normal => match key.code {
+                    KeyCode::Char('h') | KeyCode::Left => editor.move_left(),
+                    KeyCode::Char('l') | KeyCode::Right => editor.move_right(),
+                    KeyCode::Char('k') | KeyCode::Up => editor.move_up(),
+                    KeyCode::Char('j') | KeyCode::Down => editor.move_down(),
+                    KeyCode::Char('i') => editor.enter_insert_mode(),
+                    _ => {}
+                },
+                Mode::Insert => match key.code {
+                    KeyCode::Esc => editor.enter_normal_mode(),
+                    _ => {}
+                },
+            },
             Event::Resize(_, _) => {}
             _ => {}
         }
