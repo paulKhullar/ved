@@ -560,7 +560,7 @@ impl Editor {
         let n = lines.len();
 
         if let Some(repl) = &mut self.repl {
-            repl.send_lines(&lines)?;
+            repl.send_cell(&lines)?;
             self.message = Some(format!("▶ sent {n} lines"));
         }
 
@@ -576,16 +576,31 @@ impl Editor {
             .unwrap_or(false)
     }
 
-    // Drain any new lines from the REPL channel into output_buf.
-    // Called from the main loop once per tick (before draw) so output appears promptly.
+    // Drain any new events from the REPL channel into output_buf.
+    // Called from the main loop once per tick. Also checks for timeout.
     pub fn drain_repl_output(&mut self) {
-        if let Some(repl) = &self.repl {
-            let new_lines = repl.poll_output();
+        if let Some(repl) = &mut self.repl {
+            // Timeout check: if the sentinel hasn't arrived in time, give up waiting.
+            // Capture elapsed before mark_idle() resets the timer.
+            if repl.is_timed_out() {
+                let secs = repl.elapsed_secs();
+                repl.mark_idle();
+                self.output_buf
+                    .push(format!("[timed out after {secs}s — Ctrl+C to interrupt]"));
+            }
+
+            let (new_lines, done) = repl.poll_output();
             self.output_buf.extend(new_lines);
-            // Cap so the buffer doesn't grow forever on chatty cells.
-            const MAX_OUTPUT: usize = 1000;
-            if self.output_buf.len() > MAX_OUTPUT {
-                let excess = self.output_buf.len() - MAX_OUTPUT;
+
+            // Done = sentinel received = cell finished cleanly.
+            if done {
+                repl.mark_idle();
+            }
+
+            // Cap so a chatty cell doesn't grow the buffer forever.
+            const MAX: usize = 1000;
+            if self.output_buf.len() > MAX {
+                let excess = self.output_buf.len() - MAX;
                 self.output_buf.drain(..excess);
             }
         }
@@ -601,9 +616,17 @@ impl Editor {
         }
     }
 
-    // Returns a short cell indicator for the status bar, e.g. " [Cell 2/4]".
-    // Returns an empty string if the document has no cell markers.
+    // Returns a short indicator for the status bar.
+    // When a cell is running, shows elapsed time instead of the cell number.
     fn cell_status_text(&self) -> String {
+        // Running indicator takes priority — most useful thing to show right now.
+        if let Some(repl) = &self.repl {
+            if repl.is_running() {
+                let secs = repl.elapsed_secs();
+                return format!(" [running… {secs}s]");
+            }
+        }
+        // Otherwise show which cell the cursor is in.
         let has_markers = self.document.lines.iter().any(|l| cells::is_cell_marker(l));
         if !has_markers {
             return String::new();
@@ -825,6 +848,23 @@ impl Editor {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         self.message = None; // any keypress clears the transient message
+
+        // Ctrl+C interrupts a running REPL cell regardless of which mode we're in.
+        // This works because the reader thread + poll design keeps the UI responsive —
+        // we can always process keypresses even while Python is executing.
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            if self.repl.as_ref().map(|r| r.is_running()).unwrap_or(false) {
+                if let Some(repl) = &mut self.repl {
+                    repl.interrupt();
+                    self.output_buf.push("[interrupted]".into());
+                }
+                self.message = Some("Cell interrupted".into());
+                return Ok(false);
+            }
+        }
+
         match self.mode {
             Mode::Normal => self.handle_normal(key),
             Mode::Insert => self.handle_insert(key),
