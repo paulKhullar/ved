@@ -68,6 +68,7 @@ struct Editor {
     cursor: Position,
     document: Document,
     mode: Mode,
+    modified: bool,
 }
 
 impl Editor {
@@ -76,6 +77,7 @@ impl Editor {
             cursor: Position { row: 0, col: 0 },
             document,
             mode: Mode::Normal,
+            modified: false,
         }
     }
 
@@ -152,6 +154,7 @@ impl Editor {
         let byte_idx = Self::col_to_byte_index(line, self.cursor.col);
         line.insert(byte_idx, ch);
         self.cursor.col = self.cursor.col.saturating_add(1);
+        self.modified = true;
     }
 
     fn insert_newline(&mut self) {
@@ -167,6 +170,7 @@ impl Editor {
         self.document.lines.insert(row + 1, new_line);
         self.cursor.row = self.cursor.row.saturating_add(1);
         self.cursor.col = 0;
+        self.modified = true;
     }
 
     fn backspace(&mut self) {
@@ -179,6 +183,7 @@ impl Editor {
             let delete_byte_idx = Self::col_to_byte_index(line, delete_col);
             line.remove(delete_byte_idx);
             self.cursor.col = delete_col;
+            self.modified = true;
             return;
         }
 
@@ -193,6 +198,7 @@ impl Editor {
         self.document.lines[prev_row].push_str(&current);
         self.cursor.row = prev_row as u16;
         self.cursor.col = prev_len_chars;
+        self.modified = true;
     }
 
     fn draw(&self) -> Result<()> {
@@ -235,7 +241,8 @@ impl Editor {
             Mode::Normal => "-- NORMAL --",
             Mode::Insert => "-- INSERT --",
         };
-        execute!(out, Print(mode_text))?;
+        let modified_marker = if self.modified { " [+]" } else { "" };
+        execute!(out, Print(format!("{mode_text}{modified_marker}")))?;
 
         let cursor_row = self.cursor.row.min(content_rows.saturating_sub(1));
         let cursor_col = self.cursor.col.min(cols.saturating_sub(1));
