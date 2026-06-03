@@ -724,7 +724,7 @@ impl Editor {
                 }
             }
             // s = substitute char: delete char, enter Insert (like xi)
-            KeyCode::Char('r') => {
+            KeyCode::Char('s') => {
                 self.delete_char_at_cursor();
                 self.enter_insert_mode();
             }
