@@ -3,7 +3,7 @@ use std::io::{stdout, Write};
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     style::Print,
     terminal::{self, ClearType},
@@ -84,13 +84,24 @@ impl Editor {
         self.document
             .lines
             .get(row)
-            .map(|line| line.len().min(u16::MAX as usize) as u16)
+            .map(|line| line.chars().count().min(u16::MAX as usize) as u16)
             .unwrap_or(0)
     }
 
     fn clamp_col(&mut self) {
         let max_col = self.current_line_len();
         self.cursor.col = self.cursor.col.min(max_col);
+    }
+
+    fn col_to_byte_index(line: &str, col: u16) -> usize {
+        let mut current_col: u16 = 0;
+        for (byte_idx, _) in line.char_indices() {
+            if current_col == col {
+                return byte_idx;
+            }
+            current_col = current_col.saturating_add(1);
+        }
+        line.len()
     }
 
     fn move_left(&mut self) {
@@ -123,6 +134,24 @@ impl Editor {
 
     fn enter_normal_mode(&mut self) {
         self.mode = Mode::Normal;
+    }
+
+    fn ensure_line_exists(&mut self) {
+        if self.document.lines.is_empty() {
+            self.document.lines.push(String::new());
+        }
+        if (self.cursor.row as usize) >= self.document.lines.len() {
+            self.cursor.row = (self.document.lines.len() - 1) as u16;
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.ensure_line_exists();
+        let row = self.cursor.row as usize;
+        let line = &mut self.document.lines[row];
+        let byte_idx = Self::col_to_byte_index(line, self.cursor.col);
+        line.insert(byte_idx, ch);
+        self.cursor.col = self.cursor.col.saturating_add(1);
     }
 
     fn draw(&self) -> Result<()> {
@@ -211,6 +240,12 @@ fn main() -> Result<()> {
                 },
                 Mode::Insert => match key.code {
                     KeyCode::Esc => editor.enter_normal_mode(),
+                    KeyCode::Char(ch)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        editor.insert_char(ch);
+                    }
                     _ => {}
                 },
             },
