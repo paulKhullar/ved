@@ -25,10 +25,60 @@ pub enum Mode {
     OperatorPending(char), // 'd', 'c', 'y' — awaiting a motion
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
     pub row: u16,
     pub col: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeKind {
+    Char,
+    Line,
+}
+
+// A selection in document coordinates.
+// `end` is exclusive (Rust-style), which keeps slicing math simple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Range {
+    start: Position,
+    end: Position,
+    kind: RangeKind,
+}
+
+impl Range {
+    fn normalized(self) -> Self {
+        match self.kind {
+            RangeKind::Line => {
+                if self.start.row <= self.end.row {
+                    self
+                } else {
+                    Self {
+                        start: self.end,
+                        end: self.start,
+                        kind: self.kind,
+                    }
+                }
+            }
+            RangeKind::Char => {
+                if (self.start.row, self.start.col) <= (self.end.row, self.end.col) {
+                    self
+                } else {
+                    Self {
+                        start: self.end,
+                        end: self.start,
+                        kind: self.kind,
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Operator {
+    Delete,
+    Change,
 }
 
 pub struct Editor {
@@ -130,6 +180,93 @@ impl Editor {
         self.cursor.col = self.cursor.col.min(max);
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 9a — motions compute ranges (no mutation)
+    // -------------------------------------------------------------------------
+
+    fn range_current_line(&self) -> Range {
+        let row = self.cursor.row;
+        Range {
+            start: Position { row, col: 0 },
+            end: Position {
+                row: row.saturating_add(1),
+                col: 0,
+            },
+            kind: RangeKind::Line,
+        }
+    }
+
+    fn range_to_line_end(&self) -> Range {
+        let row = self.cursor.row;
+        let end_col = self.current_line_len();
+        Range {
+            start: self.cursor,
+            end: Position { row, col: end_col },
+            kind: RangeKind::Char,
+        }
+    }
+
+    fn range_to_line_start(&self) -> Range {
+        let row = self.cursor.row;
+        Range {
+            start: Position { row, col: 0 },
+            end: self.cursor,
+            kind: RangeKind::Char,
+        }
+        .normalized()
+    }
+
+    fn range_word(&self) -> Range {
+        let row = self.cursor.row as usize;
+        let start = self.cursor;
+        let mut end_col = start.col;
+
+        if let Some(line) = self.document.lines.get(row) {
+            let chars: Vec<char> = line.chars().collect();
+            let mut end = start.col as usize;
+            while end < chars.len() && !chars[end].is_whitespace() {
+                end += 1;
+            }
+            while end < chars.len() && chars[end].is_whitespace() {
+                end += 1;
+            }
+            end_col = end.min(u16::MAX as usize) as u16;
+        }
+
+        Range {
+            start,
+            end: Position {
+                row: start.row,
+                col: end_col,
+            },
+            kind: RangeKind::Char,
+        }
+    }
+
+    fn range_to_first_nonblank(&self) -> Option<Range> {
+        let row = self.cursor.row as usize;
+        let target = self
+            .document
+            .lines
+            .get(row)
+            .and_then(|l| l.chars().position(|c| !c.is_whitespace()))
+            .unwrap_or(0) as u16;
+
+        // Preserve existing behavior: only d^/c^ when target is to the *left*.
+        if target < self.cursor.col {
+            Some(Range {
+                start: Position {
+                    row: self.cursor.row,
+                    col: target,
+                },
+                end: self.cursor,
+                kind: RangeKind::Char,
+            })
+        } else {
+            None
+        }
+    }
+
     fn ensure_line_exists(&mut self) {
         if self.document.lines.is_empty() {
             self.document.lines.push(String::new());
@@ -137,6 +274,157 @@ impl Editor {
         let last = (self.document.lines.len() - 1) as u16;
         if self.cursor.row > last {
             self.cursor.row = last;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 9a — core editing primitives
+    // -------------------------------------------------------------------------
+
+    #[allow(dead_code)]
+    fn text_in(&self, range: Range) -> String {
+        let range = range.normalized();
+        match range.kind {
+            RangeKind::Line => {
+                let start = range.start.row as usize;
+                let end = range.end.row as usize;
+                let end = end.min(self.document.lines.len());
+                if start >= end {
+                    return String::new();
+                }
+                self.document.lines[start..end].join("\n") + "\n"
+            }
+            RangeKind::Char => {
+                let start_row = range.start.row as usize;
+                let end_row = range.end.row as usize;
+                if start_row >= self.document.lines.len() || end_row >= self.document.lines.len()
+                {
+                    return String::new();
+                }
+
+                if start_row == end_row {
+                    let line = &self.document.lines[start_row];
+                    let a = col_to_byte(line, range.start.col);
+                    let b = col_to_byte(line, range.end.col);
+                    return line[a..b].to_string();
+                }
+
+                let mut out = String::new();
+                // start line tail
+                {
+                    let line = &self.document.lines[start_row];
+                    let a = col_to_byte(line, range.start.col);
+                    out.push_str(&line[a..]);
+                    out.push('\n');
+                }
+                // full middle lines
+                for row in (start_row + 1)..end_row {
+                    out.push_str(&self.document.lines[row]);
+                    out.push('\n');
+                }
+                // end line head
+                {
+                    let line = &self.document.lines[end_row];
+                    let b = col_to_byte(line, range.end.col);
+                    out.push_str(&line[..b]);
+                }
+                out
+            }
+        }
+    }
+
+    fn delete_range(&mut self, range: Range) {
+        let range = range.normalized();
+        self.ensure_line_exists();
+
+        match range.kind {
+            RangeKind::Line => {
+                let start_row = range.start.row as usize;
+                let end_row = range.end.row as usize;
+                let end_row = end_row.min(self.document.lines.len());
+
+                // Preserve dd behavior: keep the current column when possible.
+                let desired_col = self.cursor.col;
+
+                if start_row < end_row {
+                    self.document.lines.drain(start_row..end_row);
+                }
+
+                // dd on the last line should still leave the document editable.
+                if self.document.lines.is_empty() {
+                    self.document.lines.push(String::new());
+                }
+
+                let last = self.document.lines.len().saturating_sub(1);
+                self.cursor.row = start_row.min(last) as u16;
+                self.cursor.col = desired_col;
+                self.clamp_col();
+                self.modified = true;
+            }
+            RangeKind::Char => {
+                let start_row = range.start.row as usize;
+                let end_row = range.end.row as usize;
+                if start_row >= self.document.lines.len() || end_row >= self.document.lines.len() {
+                    return;
+                }
+
+                if start_row == end_row {
+                    let line = &mut self.document.lines[start_row];
+                    let a = col_to_byte(line, range.start.col);
+                    let b = col_to_byte(line, range.end.col);
+                    line.drain(a..b);
+                } else {
+                    // Merge: prefix of start line + suffix of end line, then remove the middle lines.
+                    let (start_prefix, end_suffix) = {
+                        let start_line = &self.document.lines[start_row];
+                        let end_line = &self.document.lines[end_row];
+                        let a = col_to_byte(start_line, range.start.col);
+                        let b = col_to_byte(end_line, range.end.col);
+                        (start_line[..a].to_string(), end_line[b..].to_string())
+                    };
+
+                    // Remove end_row down to start_row+1 (inclusive) so indices stay valid.
+                    self.document.lines.drain((start_row + 1)..=end_row);
+                    self.document.lines[start_row] = start_prefix + &end_suffix;
+                }
+
+                self.cursor = range.start;
+                self.clamp_col();
+                self.modified = true;
+            }
+        }
+    }
+
+    fn apply_operator(&mut self, op: Operator, range: Range) {
+        let range = range.normalized();
+        match op {
+            Operator::Delete => {
+                self.delete_range(range);
+                self.mode = Mode::Normal;
+            }
+            Operator::Change => match range.kind {
+                RangeKind::Char => {
+                    self.delete_range(range);
+                    self.mode = Mode::Insert;
+                }
+                RangeKind::Line => {
+                    // Preserve cc semantics: replace the selected lines with one empty line,
+                    // then enter Insert at column 0.
+                    let start_row = range.start.row as usize;
+                    let end_row = (range.end.row as usize).min(self.document.lines.len());
+
+                    if start_row < end_row {
+                        self.document.lines.drain(start_row..end_row);
+                    }
+
+                    let row = start_row.min(self.document.lines.len());
+                    self.document.lines.insert(row, String::new());
+                    self.cursor.row = row as u16;
+                    self.cursor.col = 0;
+                    self.mode = Mode::Insert;
+                    self.modified = true;
+                }
+            },
         }
     }
 
@@ -415,87 +703,6 @@ impl Editor {
         self.mode = Mode::Insert;
     }
 
-    // dd — delete entire current line
-    fn delete_current_line(&mut self) {
-        self.ensure_line_exists();
-        let row = self.cursor.row as usize;
-        self.document.lines.remove(row);
-        if self.document.lines.is_empty() {
-            self.document.lines.push(String::new());
-        }
-        if self.cursor.row as usize >= self.document.lines.len() {
-            self.cursor.row = self.cursor.row.saturating_sub(1);
-        }
-        self.clamp_col();
-        self.modified = true;
-    }
-
-    // D / d$ — delete from cursor to end of line
-    fn delete_to_line_end(&mut self) {
-        self.ensure_line_exists();
-        let row = self.cursor.row as usize;
-        let byte_idx = col_to_byte(&self.document.lines[row], self.cursor.col);
-        self.document.lines[row].truncate(byte_idx);
-        self.clamp_col();
-        self.modified = true;
-    }
-
-    // d0 — delete from beginning of line to (not including) cursor
-    fn delete_to_line_start(&mut self) {
-        self.ensure_line_exists();
-        let row = self.cursor.row as usize;
-        let byte_idx = col_to_byte(&self.document.lines[row], self.cursor.col);
-        self.document.lines[row].drain(..byte_idx);
-        self.cursor.col = 0;
-        self.modified = true;
-    }
-
-    // dw — delete from cursor to start of next word
-    fn delete_word(&mut self) {
-        self.ensure_line_exists();
-        let row = self.cursor.row as usize;
-        // We need to borrow `lines` immutably to compute byte indices, then mutably to drain.
-        // Splitting the borrow into a scoped block lets the immutable borrow end first.
-        let (start_byte, end_byte) = {
-            let line = &self.document.lines[row];
-            let chars: Vec<char> = line.chars().collect();
-            let start = self.cursor.col as usize;
-            let mut end = start;
-            while end < chars.len() && !chars[end].is_whitespace() {
-                end += 1;
-            }
-            while end < chars.len() && chars[end].is_whitespace() {
-                end += 1;
-            }
-            (col_to_byte(line, start as u16), col_to_byte(line, end as u16))
-        };
-        self.document.lines[row].drain(start_byte..end_byte);
-        self.clamp_col();
-        self.modified = true;
-    }
-
-    // cc — clear the line and enter Insert (like Vim's S)
-    fn change_line(&mut self) {
-        self.ensure_line_exists();
-        let row = self.cursor.row as usize;
-        self.document.lines[row].clear();
-        self.cursor.col = 0;
-        self.mode = Mode::Insert;
-        self.modified = true;
-    }
-
-    // C / c$ — delete to end of line, enter Insert
-    fn change_to_line_end(&mut self) {
-        self.delete_to_line_end();
-        self.mode = Mode::Insert;
-    }
-
-    // cw — delete word, enter Insert
-    fn change_word(&mut self) {
-        self.delete_word();
-        self.mode = Mode::Insert;
-    }
-
     // -------------------------------------------------------------------------
     // Phase 8a — cell navigation
     // -------------------------------------------------------------------------
@@ -578,7 +785,8 @@ impl Editor {
 
     // Drain any new events from the REPL channel into output_buf.
     // Called from the main loop once per tick. Also checks for timeout.
-    pub fn drain_repl_output(&mut self) {
+    pub fn drain_repl_output(&mut self) -> bool {
+        let mut changed = false;
         if let Some(repl) = &mut self.repl {
             // Timeout check: if the sentinel hasn't arrived in time, give up waiting.
             // Capture elapsed before mark_idle() resets the timer.
@@ -587,14 +795,19 @@ impl Editor {
                 repl.mark_idle();
                 self.output_buf
                     .push(format!("[timed out after {secs}s — Ctrl+C to interrupt]"));
+                changed = true;
             }
 
             let (new_lines, done) = repl.poll_output();
-            self.output_buf.extend(new_lines);
+            if !new_lines.is_empty() {
+                self.output_buf.extend(new_lines);
+                changed = true;
+            }
 
             // Done = sentinel received = cell finished cleanly.
             if done {
                 repl.mark_idle();
+                changed = true;
             }
 
             // Cap so a chatty cell doesn't grow the buffer forever.
@@ -602,8 +815,10 @@ impl Editor {
             if self.output_buf.len() > MAX {
                 let excess = self.output_buf.len() - MAX;
                 self.output_buf.drain(..excess);
+                changed = true;
             }
         }
+        changed
     }
 
     // How many screen rows to reserve for the output panel.
@@ -725,7 +940,8 @@ impl Editor {
 
         self.scroll_to_cursor(content_rows);
 
-        execute!(out, cursor::Hide, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+        // Avoid clearing the entire screen every frame; we clear per-line below.
+        execute!(out, cursor::Hide, cursor::MoveTo(0, 0))?;
 
         // --- Document area ---
         for screen_row in 0..content_rows {
@@ -992,9 +1208,15 @@ impl Editor {
                 self.enter_insert_mode();
             }
             // D = delete to end of line (same as d$)
-            KeyCode::Char('D') => self.delete_to_line_end(),
+            KeyCode::Char('D') => {
+                let range = self.range_to_line_end();
+                self.apply_operator(Operator::Delete, range);
+            }
             // C = change to end of line (same as c$)
-            KeyCode::Char('C') => self.change_to_line_end(),
+            KeyCode::Char('C') => {
+                let range = self.range_to_line_end();
+                self.apply_operator(Operator::Change, range);
+            }
 
             // Operators — enter OperatorPending to wait for the motion
             KeyCode::Char('d') => self.mode = Mode::OperatorPending('d'),
@@ -1075,48 +1297,43 @@ impl Editor {
         // paths (change ops) will overwrite it.
         self.mode = Mode::Normal;
 
+        let op = match op {
+            'd' => Operator::Delete,
+            'c' => Operator::Change,
+            _ => return Ok(false),
+        };
+
         match key.code {
             KeyCode::Esc => {} // cancel operator
 
             // Doubled operator = operate on whole line  (dd, cc)
-            KeyCode::Char('d') if op == 'd' => self.delete_current_line(),
-            KeyCode::Char('c') if op == 'c' => self.change_line(),
+            KeyCode::Char('d') if op == Operator::Delete => {
+                let range = self.range_current_line();
+                self.apply_operator(op, range);
+            }
+            KeyCode::Char('c') if op == Operator::Change => {
+                let range = self.range_current_line();
+                self.apply_operator(op, range);
+            }
 
             // Motions
-            KeyCode::Char('w') => match op {
-                'd' => self.delete_word(),
-                'c' => self.change_word(),
-                _ => {}
-            },
-            KeyCode::Char('$') => match op {
-                'd' => self.delete_to_line_end(),
-                'c' => self.change_to_line_end(),
-                _ => {}
-            },
-            KeyCode::Char('0') => match op {
-                'd' => self.delete_to_line_start(),
-                _ => {}
-            },
+            KeyCode::Char('w') => {
+                let range = self.range_word();
+                self.apply_operator(op, range);
+            }
+            KeyCode::Char('$') => {
+                let range = self.range_to_line_end();
+                self.apply_operator(op, range);
+            }
+            KeyCode::Char('0') => {
+                if op == Operator::Delete {
+                    let range = self.range_to_line_start();
+                    self.apply_operator(op, range);
+                }
+            }
             KeyCode::Char('^') => {
-                // d^ / c^ — operate from cursor to first non-blank
-                let target = {
-                    let row = self.cursor.row as usize;
-                    self.document
-                        .lines
-                        .get(row)
-                        .and_then(|l| l.chars().position(|c| !c.is_whitespace()))
-                        .unwrap_or(0) as u16
-                };
-                if target < self.cursor.col {
-                    let row = self.cursor.row as usize;
-                    let start = col_to_byte(&self.document.lines[row], target);
-                    let end = col_to_byte(&self.document.lines[row], self.cursor.col);
-                    self.document.lines[row].drain(start..end);
-                    self.cursor.col = target;
-                    self.modified = true;
-                    if op == 'c' {
-                        self.mode = Mode::Insert;
-                    }
+                if let Some(range) = self.range_to_first_nonblank() {
+                    self.apply_operator(op, range);
                 }
             }
 

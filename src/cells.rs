@@ -9,6 +9,7 @@ pub struct CellRange {
     pub end: usize,
 }
 
+#[allow(dead_code)]
 impl CellRange {
     /// Borrow the actual lines belonging to this cell.
     pub fn as_lines<'a>(&self, all_lines: &'a [String]) -> &'a [String] {

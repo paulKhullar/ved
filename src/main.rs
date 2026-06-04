@@ -56,23 +56,36 @@ fn main() -> Result<()> {
     };
     let mut editor = Editor::new(document, file_path);
 
+    // Redraw only when something changes (keypress, resize, new REPL output).
+    // Constant full-screen redraw causes visible blinking in many terminals.
+    let mut needs_redraw = true;
+
     loop {
         // Drain any REPL output that arrived since the last tick.
         // This happens before draw() so new output is always visible immediately.
-        editor.drain_repl_output();
-        editor.draw()?;
+        if editor.drain_repl_output() {
+            needs_redraw = true;
+        }
+
+        if needs_redraw {
+            editor.draw()?;
+            needs_redraw = false;
+        }
 
         // poll(50ms) instead of blocking read() so output appears promptly even
         // when the user isn't typing. If no key arrives within 50ms we loop back
-        // and redraw — the REPL output panel updates at ~20fps.
+        // and check for REPL output.
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
                     if editor.handle_key(key)? {
                         break;
                     }
+                    needs_redraw = true;
                 }
-                Event::Resize(_, _) => {}
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
+                }
                 _ => {}
             }
         }
