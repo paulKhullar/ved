@@ -5,7 +5,9 @@ use crossterm::{
     cursor,
     event::{KeyCode, KeyEvent, KeyModifiers},
     execute,
-    style::{Attribute, Print, SetAttribute},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    },
     terminal::{self, ClearType},
 };
 
@@ -23,6 +25,13 @@ pub enum Mode {
     Insert,
     Command,
     OperatorPending(char), // 'd', 'c', 'y' — awaiting a motion
+    Visual(VisualKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualKind {
+    Char,
+    Line,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +88,7 @@ impl Range {
 enum Operator {
     Delete,
     Change,
+    Yank,
 }
 
 pub struct Editor {
@@ -86,15 +96,18 @@ pub struct Editor {
     scroll_offset: usize,
     document: Document,
     file_path: Option<String>,
+    treat_as_python: bool,
     mode: Mode,
     modified: bool,
     command_buf: String,
     message: Option<String>,
+    register: Option<(String, RangeKind)>, // Vim unnamed register
     // Accumulates digit keypresses before a command, e.g. "10" in "10j".
     count_buf: String,
     // Tracks a partial two-key sequence. Currently only used for 'g' → 'g' (go to first line).
     // Option::take() is used to read-and-clear it atomically — a handy Rust idiom.
     pending_char: Option<char>,
+    visual_anchor: Option<Position>,
 
     // Phase 8b — REPL integration
     repl: Option<Repl>,       // None until first Space+Enter in a .py file (lazy start)
@@ -141,22 +154,53 @@ fn col_to_byte(line: &str, col: u16) -> usize {
 // Number of output lines shown in the REPL panel (not counting the separator row).
 const OUTPUT_PANEL_HEIGHT: usize = 8;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SpanStyle {
+    fg: Option<Color>,
+    bg: Option<Color>,
+    bold: bool,
+    dim: bool,
+    reverse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Span {
+    text: String,
+    style: SpanStyle,
+}
+
+impl Span {
+    fn new(text: impl Into<String>, style: SpanStyle) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+}
+
 impl Editor {
-    pub fn new(document: Document, file_path: Option<String>) -> Self {
+    pub fn new(document: Document, file_path: Option<String>, treat_as_python: bool) -> Self {
         Self {
             cursor: Position::default(),
             scroll_offset: 0,
             document,
             file_path,
+            treat_as_python,
             mode: Mode::Normal,
             modified: false,
             command_buf: String::new(),
             message: None,
+            register: None,
             count_buf: String::new(),
             pending_char: None,
+            visual_anchor: None,
             repl: None,
             output_buf: Vec::new(),
         }
+    }
+
+    pub fn set_message(&mut self, msg: impl Into<String>) {
+        self.message = Some(msg.into());
     }
 
     // -------------------------------------------------------------------------
@@ -264,6 +308,47 @@ impl Editor {
             })
         } else {
             None
+        }
+    }
+
+    fn visual_range(&self, kind: VisualKind) -> Option<Range> {
+        let anchor = self.visual_anchor?;
+        match kind {
+            VisualKind::Line => {
+                let a = anchor.row.min(self.cursor.row);
+                let b = anchor.row.max(self.cursor.row);
+                Some(Range {
+                    start: Position { row: a, col: 0 },
+                    end: Position {
+                        row: b.saturating_add(1),
+                        col: 0,
+                    },
+                    kind: RangeKind::Line,
+                })
+            }
+            VisualKind::Char => {
+                let (start, end_inclusive) = if (anchor.row, anchor.col) <= (self.cursor.row, self.cursor.col) {
+                    (anchor, self.cursor)
+                } else {
+                    (self.cursor, anchor)
+                };
+
+                let end_row = end_inclusive.row as usize;
+                let line_len = self.line_len(end_row);
+                let end_exclusive_col = end_inclusive.col.saturating_add(1).min(line_len);
+
+                Some(
+                    Range {
+                        start,
+                        end: Position {
+                            row: end_inclusive.row,
+                            col: end_exclusive_col,
+                        },
+                        kind: RangeKind::Char,
+                    }
+                    .normalized(),
+                )
+            }
         }
     }
 
@@ -397,6 +482,14 @@ impl Editor {
 
     fn apply_operator(&mut self, op: Operator, range: Range) {
         let range = range.normalized();
+
+        // Vim behavior: d/c/y all update the unnamed register with the operated text.
+        // For delete/change, capture the text *before* mutation.
+        let yanked_text = self.text_in(range);
+        if matches!(op, Operator::Delete | Operator::Change | Operator::Yank) {
+            self.register = Some((yanked_text, range.kind));
+        }
+
         match op {
             Operator::Delete => {
                 self.delete_range(range);
@@ -425,6 +518,122 @@ impl Editor {
                     self.modified = true;
                 }
             },
+            Operator::Yank => {
+                self.mode = Mode::Normal;
+                // yanking does not modify the buffer
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 9b — paste from register
+    // -------------------------------------------------------------------------
+
+    fn paste_after(&mut self) {
+        let Some((text, kind)) = self.register.clone() else {
+            return;
+        };
+
+        match kind {
+            RangeKind::Line => self.paste_linewise(text, true),
+            RangeKind::Char => self.paste_charwise(&text, true),
+        }
+    }
+
+    fn paste_before(&mut self) {
+        let Some((text, kind)) = self.register.clone() else {
+            return;
+        };
+
+        match kind {
+            RangeKind::Line => self.paste_linewise(text, false),
+            RangeKind::Char => self.paste_charwise(&text, false),
+        }
+    }
+
+    fn paste_linewise(&mut self, text: String, after: bool) {
+        self.ensure_line_exists();
+        let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+        if lines.is_empty() {
+            return;
+        }
+
+        let row = self.cursor.row as usize;
+        let insert_at = if after { row + 1 } else { row };
+        let insert_at = insert_at.min(self.document.lines.len());
+
+        for (i, line) in lines.drain(..).enumerate() {
+            self.document.lines.insert(insert_at + i, line);
+        }
+
+        self.cursor.row = insert_at as u16;
+        self.cursor.col = 0;
+        self.modified = true;
+    }
+
+    fn paste_charwise(&mut self, text: &str, after: bool) {
+        self.ensure_line_exists();
+
+        let row = self.cursor.row as usize;
+        let line_len = self.line_len(row);
+
+        let mut col = self.cursor.col;
+        if after {
+            // Paste after the cursor; clamp to end-of-line.
+            col = col.saturating_add(1).min(line_len);
+        } else {
+            col = col.min(line_len);
+        }
+
+        let cursor_after = self.insert_text_at(Position { row: self.cursor.row, col }, text);
+        self.cursor = cursor_after;
+        self.modified = true;
+    }
+
+    // Insert arbitrary text at a character position, splitting lines on '\n' if needed.
+    // Returns the cursor position at the last inserted character (Vim-like).
+    fn insert_text_at(&mut self, pos: Position, text: &str) -> Position {
+        let row = pos.row as usize;
+        if row >= self.document.lines.len() {
+            self.document.lines.push(String::new());
+        }
+
+        if !text.contains('\n') {
+            let line = &mut self.document.lines[row];
+            let byte_idx = col_to_byte(line, pos.col);
+            line.insert_str(byte_idx, text);
+            let inserted = text.chars().count().min(u16::MAX as usize) as u16;
+            return Position {
+                row: pos.row,
+                col: pos.col.saturating_add(inserted).saturating_sub(1),
+            };
+        }
+
+        let parts: Vec<&str> = text.split('\n').collect();
+        let (prefix, suffix) = {
+            let line = &self.document.lines[row];
+            let byte_idx = col_to_byte(line, pos.col);
+            (line[..byte_idx].to_string(), line[byte_idx..].to_string())
+        };
+
+        self.document.lines[row] = format!("{}{}", prefix, parts[0]);
+
+        for (i, part) in parts.iter().enumerate().skip(1) {
+            let insert_row = row + i;
+            self.document.lines.insert(insert_row, part.to_string());
+        }
+
+        let last_row = row + parts.len() - 1;
+        self.document.lines[last_row].push_str(&suffix);
+
+        let last_part_len = parts
+            .last()
+            .map(|p| p.chars().count().min(u16::MAX as usize) as u16)
+            .unwrap_or(0);
+
+        Position {
+            row: last_row as u16,
+            col: last_part_len.saturating_sub(1),
         }
     }
 
@@ -777,6 +986,9 @@ impl Editor {
     // Returns true if the open file is a Python file (by extension).
     // Used to decide whether to auto-start the REPL on Space+Enter.
     fn is_python_file(&self) -> bool {
+        if self.treat_as_python {
+            return true;
+        }
         self.file_path
             .as_deref()
             .map(|p| p.ends_with(".py"))
@@ -875,9 +1087,18 @@ impl Editor {
         let cmd = self.command_buf.trim().to_string();
         self.command_buf.clear();
         self.mode = Mode::Normal;
-        match cmd.as_str() {
+
+        let verb = cmd.split_whitespace().next().unwrap_or("");
+        let arg = cmd.get(verb.len()..).unwrap_or("").trim();
+
+        match verb {
             "w" | "write" => {
-                self.save()?;
+                if arg.is_empty() {
+                    self.save()?;
+                } else {
+                    self.file_path = Some(arg.to_string());
+                    self.save()?;
+                }
                 Ok(false)
             }
             "q" => {
@@ -890,8 +1111,14 @@ impl Editor {
                 }
             }
             "wq" | "x" => {
-                self.save()?;
-                Ok(true)
+                if arg.is_empty() {
+                    self.save()?;
+                    Ok(true)
+                } else {
+                    self.file_path = Some(arg.to_string());
+                    self.save()?;
+                    Ok(true)
+                }
             }
             "q!" => Ok(true),
             other => {
@@ -943,6 +1170,13 @@ impl Editor {
         // Avoid clearing the entire screen every frame; we clear per-line below.
         execute!(out, cursor::Hide, cursor::MoveTo(0, 0))?;
 
+        // Phase 9d: draw each line as a sequence of (text, style) spans.
+        // Visual selection is applied as a reverse-video overlay on top of spans.
+        let visual_selection = match self.mode {
+            Mode::Visual(kind) => self.visual_range(kind),
+            _ => None,
+        };
+
         // --- Document area ---
         for screen_row in 0..content_rows {
             let doc_row = self.scroll_offset + screen_row;
@@ -951,24 +1185,17 @@ impl Editor {
                 cursor::MoveTo(0, screen_row as u16),
                 terminal::Clear(ClearType::CurrentLine)
             )?;
-            match self.document.lines.get(doc_row) {
-                Some(text) if cells::is_cell_marker(text) => {
-                    let divider = render_cell_divider(text, cols as usize);
-                    execute!(
-                        out,
-                        SetAttribute(Attribute::Bold),
-                        Print(divider),
-                        SetAttribute(Attribute::Reset),
-                    )?;
-                }
-                Some(text) => {
-                    let visible: String = text.chars().take(cols as usize).collect();
-                    execute!(out, Print(visible))?;
-                }
-                None => {
-                    execute!(out, Print("~"))?;
+            let mut spans = self.spans_for_document_line(doc_row, cols as usize);
+            spans = truncate_spans(&spans, cols as usize);
+
+            if let Some(sel) = visual_selection {
+                if let Some((start, end)) = selection_segment_for_row(self, sel, doc_row) {
+                    spans = apply_reverse_overlay(&spans, start, end);
+                    spans = truncate_spans(&spans, cols as usize);
                 }
             }
+
+            render_spans(&mut out, &spans, cols as usize)?;
         }
 
         // --- REPL output panel ---
@@ -982,11 +1209,15 @@ impl Editor {
             )?;
             let header = "── REPL ";
             let fill = "─".repeat((cols as usize).saturating_sub(header.len()));
-            execute!(
-                out,
-                SetAttribute(Attribute::Bold),
-                Print(format!("{header}{fill}")),
-                SetAttribute(Attribute::Reset),
+            let header_style = SpanStyle {
+                fg: Some(Color::Magenta),
+                bold: true,
+                ..SpanStyle::default()
+            };
+            render_spans(
+                &mut out,
+                &[Span::new(format!("{header}{fill}"), header_style)],
+                cols as usize,
             )?;
 
             // Show the last OUTPUT_PANEL_HEIGHT lines of output.
@@ -1000,8 +1231,13 @@ impl Editor {
                     terminal::Clear(ClearType::CurrentLine)
                 )?;
                 if let Some(line) = visible_lines.get(i) {
-                    let visible: String = line.chars().take(cols as usize).collect();
-                    execute!(out, Print(visible))?;
+                    let style = SpanStyle {
+                        fg: Some(Color::DarkGrey),
+                        dim: true,
+                        ..SpanStyle::default()
+                    };
+                    let spans = truncate_spans(&[Span::new(line.as_str(), style)], cols as usize);
+                    render_spans(&mut out, &spans, cols as usize)?;
                 }
             }
         }
@@ -1027,6 +1263,10 @@ impl Editor {
                     Mode::Insert => "-- INSERT --".to_string(),
                     // Show which operator is pending so the user can see what they typed.
                     Mode::OperatorPending(op) => format!("-- {op}? --"),
+                    Mode::Visual(kind) => match kind {
+                        VisualKind::Char => "-- VISUAL --".to_string(),
+                        VisualKind::Line => "-- VISUAL LINE --".to_string(),
+                    },
                     Mode::Command => unreachable!(),
                 };
                 let modified = if self.modified { " [+]" } else { "" };
@@ -1058,6 +1298,34 @@ impl Editor {
         Ok(())
     }
 
+    fn spans_for_document_line(&self, doc_row: usize, cols: usize) -> Vec<Span> {
+        let marker_style = SpanStyle {
+            fg: Some(Color::DarkYellow),
+            bold: true,
+            ..SpanStyle::default()
+        };
+        let tilde_style = SpanStyle {
+            fg: Some(Color::DarkGrey),
+            dim: true,
+            ..SpanStyle::default()
+        };
+
+        match self.document.lines.get(doc_row) {
+            Some(text) if cells::is_cell_marker(text) => {
+                let divider = render_cell_divider(text, cols);
+                vec![Span::new(divider, marker_style)]
+            }
+            Some(text) => {
+                if self.is_python_file() {
+                    python_spans(text)
+                } else {
+                    vec![Span::new(text, SpanStyle::default())]
+                }
+            }
+            None => vec![Span::new("~", tilde_style)],
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Event dispatch
     // -------------------------------------------------------------------------
@@ -1086,6 +1354,7 @@ impl Editor {
             Mode::Insert => self.handle_insert(key),
             Mode::Command => self.handle_command(key),
             Mode::OperatorPending(op) => self.handle_operator_pending(op, key),
+            Mode::Visual(kind) => self.handle_visual(kind, key),
         }
     }
 
@@ -1221,6 +1490,30 @@ impl Editor {
             // Operators — enter OperatorPending to wait for the motion
             KeyCode::Char('d') => self.mode = Mode::OperatorPending('d'),
             KeyCode::Char('c') => self.mode = Mode::OperatorPending('c'),
+            KeyCode::Char('y') => self.mode = Mode::OperatorPending('y'),
+
+            // Paste
+            KeyCode::Char('p') => {
+                for _ in 0..count {
+                    self.paste_after();
+                }
+            }
+            KeyCode::Char('P') => {
+                for _ in 0..count {
+                    self.paste_before();
+                }
+            }
+
+            // Visual mode
+            KeyCode::Char('v') => {
+                self.visual_anchor = Some(self.cursor);
+                self.mode = Mode::Visual(VisualKind::Char);
+            }
+            KeyCode::Char('V') => {
+                self.visual_anchor = Some(Position { row: self.cursor.row, col: 0 });
+                self.cursor.col = 0;
+                self.mode = Mode::Visual(VisualKind::Line);
+            }
 
             // Cell navigation — first key of a two-key sequence
             KeyCode::Char(']') => { self.pending_char = Some(']'); }
@@ -1290,6 +1583,56 @@ impl Editor {
         Ok(false)
     }
 
+    fn handle_visual(&mut self, kind: VisualKind, key: KeyEvent) -> Result<bool> {
+        // Visual mode doesn't currently render highlights (that's Phase 9d),
+        // but we do make d/c/y operate on the anchor↔cursor range.
+        match key.code {
+            KeyCode::Esc => {
+                self.visual_anchor = None;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('v') if kind == VisualKind::Char => {
+                self.visual_anchor = None;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('V') if kind == VisualKind::Line => {
+                self.visual_anchor = None;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.move_left(),
+            KeyCode::Char('l') | KeyCode::Right => self.move_right(),
+            KeyCode::Char('k') | KeyCode::Up => self.move_up(),
+            KeyCode::Char('j') | KeyCode::Down => self.move_down(),
+            KeyCode::Char('w') => self.word_forward(),
+            KeyCode::Char('b') => self.word_backward(),
+            KeyCode::Char('e') => self.word_end(),
+            KeyCode::Char('$') => self.go_to_line_end(),
+            KeyCode::Char('^') => self.go_to_first_non_blank(),
+            KeyCode::Char('d') | KeyCode::Char('c') | KeyCode::Char('y') => {
+                let op = match key.code {
+                    KeyCode::Char('d') => Operator::Delete,
+                    KeyCode::Char('c') => Operator::Change,
+                    KeyCode::Char('y') => Operator::Yank,
+                    _ => unreachable!(),
+                };
+                if let Some(range) = self.visual_range(kind) {
+                    self.apply_operator(op, range);
+                }
+                self.visual_anchor = None;
+                // apply_operator already set mode appropriately.
+            }
+            _ => {}
+        }
+
+        if kind == VisualKind::Line {
+            self.cursor.col = 0;
+        } else {
+            self.clamp_col();
+        }
+
+        Ok(false)
+    }
+
     // Called when we're in OperatorPending(op) and the next key arrives.
     // `op` is the operator char ('d', 'c', …); the key supplies the motion.
     fn handle_operator_pending(&mut self, op: char, key: KeyEvent) -> Result<bool> {
@@ -1300,6 +1643,7 @@ impl Editor {
         let op = match op {
             'd' => Operator::Delete,
             'c' => Operator::Change,
+            'y' => Operator::Yank,
             _ => return Ok(false),
         };
 
@@ -1315,6 +1659,10 @@ impl Editor {
                 let range = self.range_current_line();
                 self.apply_operator(op, range);
             }
+            KeyCode::Char('y') if op == Operator::Yank => {
+                let range = self.range_current_line();
+                self.apply_operator(op, range);
+            }
 
             // Motions
             KeyCode::Char('w') => {
@@ -1326,7 +1674,7 @@ impl Editor {
                 self.apply_operator(op, range);
             }
             KeyCode::Char('0') => {
-                if op == Operator::Delete {
+                if op == Operator::Delete || op == Operator::Yank {
                     let range = self.range_to_line_start();
                     self.apply_operator(op, range);
                 }
@@ -1342,4 +1690,292 @@ impl Editor {
 
         Ok(false)
     }
+}
+
+// Returns an inclusive-exclusive (start_col, end_col) segment to highlight for a single
+// document row, or None if the selection does not cover this row.
+fn selection_segment_for_row(editor: &Editor, selection: Range, doc_row: usize) -> Option<(u16, u16)> {
+    let selection = selection.normalized();
+
+    match selection.kind {
+        RangeKind::Line => {
+            let start_row = selection.start.row as usize;
+            let end_row = selection.end.row as usize; // exclusive
+            if doc_row >= start_row && doc_row < end_row {
+                // Highlight the full visible width.
+                Some((0, u16::MAX))
+            } else {
+                None
+            }
+        }
+        RangeKind::Char => {
+            let start_row = selection.start.row as usize;
+            let end_row = selection.end.row as usize;
+
+            if doc_row < start_row || doc_row > end_row {
+                return None;
+            }
+
+            if start_row == end_row {
+                return Some((selection.start.col, selection.end.col));
+            }
+
+            if doc_row == start_row {
+                // From start col to end of line.
+                let len = editor.line_len(doc_row);
+                return Some((selection.start.col, len));
+            }
+
+            if doc_row == end_row {
+                // From start of line to end col.
+                return Some((0, selection.end.col));
+            }
+
+            // Full middle lines.
+            Some((0, editor.line_len(doc_row)))
+        }
+    }
+}
+
+fn apply_style(out: &mut std::io::Stdout, style: SpanStyle) -> Result<()> {
+    execute!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+
+    if style.bold {
+        execute!(out, SetAttribute(Attribute::Bold))?;
+    }
+    if style.dim {
+        execute!(out, SetAttribute(Attribute::Dim))?;
+    }
+    if style.reverse {
+        execute!(out, SetAttribute(Attribute::Reverse))?;
+    }
+    if let Some(fg) = style.fg {
+        execute!(out, SetForegroundColor(fg))?;
+    }
+    if let Some(bg) = style.bg {
+        execute!(out, SetBackgroundColor(bg))?;
+    }
+
+    Ok(())
+}
+
+fn render_spans(out: &mut std::io::Stdout, spans: &[Span], cols: usize) -> Result<()> {
+    let mut used: usize = 0;
+    let mut current = SpanStyle::default();
+    apply_style(out, current)?;
+
+    for span in spans {
+        if used >= cols {
+            break;
+        }
+
+        if span.style != current {
+            current = span.style;
+            apply_style(out, current)?;
+        }
+
+        let remaining = cols - used;
+        let part: String = span.text.chars().take(remaining).collect();
+        used += part.chars().count();
+        execute!(out, Print(part))?;
+    }
+
+    apply_style(out, SpanStyle::default())?;
+    Ok(())
+}
+
+fn truncate_spans(spans: &[Span], cols: usize) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::new();
+    let mut used: usize = 0;
+
+    for span in spans {
+        if used >= cols {
+            break;
+        }
+        let remaining = cols - used;
+        let text: String = span.text.chars().take(remaining).collect();
+        used += text.chars().count();
+        if !text.is_empty() {
+            out.push(Span::new(text, span.style));
+        }
+    }
+
+    out
+}
+
+fn apply_reverse_overlay(spans: &[Span], start: u16, end: u16) -> Vec<Span> {
+    let start = start as usize;
+    let end = end as usize;
+
+    let mut out: Vec<Span> = Vec::new();
+    let mut col: usize = 0;
+
+    for span in spans {
+        if span.text.is_empty() {
+            continue;
+        }
+
+        let chars: Vec<char> = span.text.chars().collect();
+        let span_start = col;
+        let span_end = col + chars.len();
+        col = span_end;
+
+        if end <= span_start || start >= span_end {
+            out.push(span.clone());
+            continue;
+        }
+
+        let sel_start = start.saturating_sub(span_start).min(chars.len());
+        let sel_end = end.saturating_sub(span_start).min(chars.len());
+
+        if sel_start > 0 {
+            out.push(Span::new(
+                chars[..sel_start].iter().collect::<String>(),
+                span.style,
+            ));
+        }
+
+        if sel_start < sel_end {
+            let mut style = span.style;
+            style.reverse = true;
+            out.push(Span::new(
+                chars[sel_start..sel_end].iter().collect::<String>(),
+                style,
+            ));
+        }
+
+        if sel_end < chars.len() {
+            out.push(Span::new(
+                chars[sel_end..].iter().collect::<String>(),
+                span.style,
+            ));
+        }
+    }
+
+    out
+}
+
+fn python_spans(line: &str) -> Vec<Span> {
+    // Phase 9e (simple version): highlight a few token classes without a real parser.
+    // - keywords: cyan + bold
+    // - strings: green
+    // - comments: dark grey + dim
+    const KEYWORDS: &[&str] = &[
+        "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
+        "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global",
+        "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
+        "try", "while", "with", "yield",
+    ];
+
+    let kw_style = SpanStyle {
+        fg: Some(Color::Cyan),
+        bold: true,
+        ..SpanStyle::default()
+    };
+    let str_style = SpanStyle {
+        fg: Some(Color::Green),
+        ..SpanStyle::default()
+    };
+    let comment_style = SpanStyle {
+        fg: Some(Color::DarkGrey),
+        dim: true,
+        ..SpanStyle::default()
+    };
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut buf = String::new();
+
+    enum State {
+        Normal,
+        String { quote: char, escaped: bool },
+    }
+    let mut state = State::Normal;
+
+    let mut it = line.chars().peekable();
+    while let Some(ch) = it.next() {
+        match state {
+            State::Normal => {
+                if ch == '#' {
+                    if !buf.is_empty() {
+                        spans.push(Span::new(std::mem::take(&mut buf), SpanStyle::default()));
+                    }
+                    let mut rest = String::new();
+                    rest.push(ch);
+                    rest.extend(it);
+                    spans.push(Span::new(rest, comment_style));
+                    break;
+                }
+
+                if ch == '\'' || ch == '"' {
+                    if !buf.is_empty() {
+                        spans.push(Span::new(std::mem::take(&mut buf), SpanStyle::default()));
+                    }
+                    spans.push(Span::new(ch.to_string(), str_style));
+                    state = State::String {
+                        quote: ch,
+                        escaped: false,
+                    };
+                    continue;
+                }
+
+                if is_ident_start(ch) {
+                    if !buf.is_empty() {
+                        spans.push(Span::new(std::mem::take(&mut buf), SpanStyle::default()));
+                    }
+                    let mut ident = String::new();
+                    ident.push(ch);
+                    while let Some(&next) = it.peek() {
+                        if is_ident_continue(next) {
+                            ident.push(next);
+                            it.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if KEYWORDS.contains(&ident.as_str()) {
+                        spans.push(Span::new(ident, kw_style));
+                    } else {
+                        spans.push(Span::new(ident, SpanStyle::default()));
+                    }
+                } else {
+                    buf.push(ch);
+                }
+            }
+            State::String { quote, escaped } => {
+                let last_is_string = spans.last().is_some_and(|s| s.style == str_style);
+                if !last_is_string {
+                    spans.push(Span::new(String::new(), str_style));
+                }
+                spans.last_mut().unwrap().text.push(ch);
+
+                if escaped {
+                    state = State::String {
+                        quote,
+                        escaped: false,
+                    };
+                } else if ch == '\\' {
+                    state = State::String {
+                        quote,
+                        escaped: true,
+                    };
+                } else if ch == quote {
+                    state = State::Normal;
+                }
+            }
+        }
+    }
+
+    if !buf.is_empty() {
+        spans.push(Span::new(buf, SpanStyle::default()));
+    }
+
+    spans
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
 }

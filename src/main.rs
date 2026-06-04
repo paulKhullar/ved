@@ -50,11 +50,31 @@ impl Drop for TerminalGuard {
 fn main() -> Result<()> {
     let _terminal = TerminalGuard::new()?;
     let file_path = std::env::args().nth(1);
-    let document = match file_path.as_deref() {
-        Some(path) => Document::open(path)?,
-        None => Document::empty(),
+    let (document, file_path, treat_as_python, message) = match file_path.as_deref() {
+        Some(path) if path.ends_with(".ipynb") => match Document::open_ipynb_as_cells(path) {
+            Ok(doc) => (
+                doc,
+                None,
+                true,
+                Some(format!(
+                    "Opened {path} as a cell view; use :w <file.py> to export"
+                )),
+            ),
+            Err(e) => (
+                Document::open(path)?,
+                Some(path.to_string()),
+                false,
+                Some(format!("Failed to parse ipynb; opened raw: {e}")),
+            ),
+        },
+        Some(path) => (Document::open(path)?, Some(path.to_string()), false, None),
+        None => (Document::empty(), None, false, None),
     };
-    let mut editor = Editor::new(document, file_path);
+
+    let mut editor = Editor::new(document, file_path, treat_as_python);
+    if let Some(msg) = message {
+        editor.set_message(msg);
+    }
 
     // Redraw only when something changes (keypress, resize, new REPL output).
     // Constant full-screen redraw causes visible blinking in many terminals.
